@@ -1,4 +1,4 @@
-name: Build Access One APK
+name: Build AccessOne APK
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     paths:
       - "Access One.zip"
       - "logo.png"
-      - ".github/workflows/main.yml"
+      - ".github/workflows/build-apk.yml"
 
 permissions:
   contents: read
@@ -35,72 +35,231 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
 
-      - name: Extract website
+      - name: Extract original website
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p website
+          test -f "Access One.zip"
+          mkdir -p website www
           unzip -o "Access One.zip" -d website
-
-          INDEX_FILE="$(find website -type f -name index.html | head -n 1)"
-
+          INDEX_FILE="$(find website -type f -name index.html -print -quit)"
           if [ -z "$INDEX_FILE" ]; then
-            echo "ERROR: index.html not found in Access One.zip"
+            echo "ERROR: index.html not found inside Access One.zip"
             exit 1
           fi
-
           WEBSITE_ROOT="$(dirname "$INDEX_FILE")"
-          mkdir -p www
           cp -R "$WEBSITE_ROOT"/. www/
 
-      - name: Create Capacitor project
+          # Keep the supplied logo file unchanged. Use the ZIP copy only if
+          # the same original logo has not also been uploaded at repository root.
+          if [ ! -f logo.png ]; then
+            test -f www/logo.png
+            cp www/logo.png ./logo.png
+          fi
+
+      - name: Create Capacitor Android project
         shell: bash
         run: |
           set -euo pipefail
           npm init -y
-          npm install @capacitor/core@latest @capacitor/android@latest
-          npm install --save-dev @capacitor/cli@latest
-
-          npx cap init "Access One" "com.accessone.app" --web-dir www
+          npm install @capacitor/core@latest @capacitor/android@latest @capacitor/app@latest @capacitor/status-bar@latest
+          npm install --save-dev @capacitor/cli@latest esbuild
+          npx cap init "AccessOne" "com.accessone.app" --web-dir www
           npx cap add android
 
-      - name: Sync Capacitor
-        run: npx cap sync android
-
-      - name: Configure Android icon
+      - name: Configure camera permission and normal Android screen
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f logo.png
-
-          mkdir -p android/app/src/main/res/drawable-nodpi
-
-          cp logo.png android/app/src/main/res/drawable-nodpi/access_one_logo.png
-
+          # Declare CAMERA permission. Capacitor's BridgeWebChromeClient handles
+          # the Android runtime permission prompt for WebView getUserMedia().
           python3 - <<'PY'
-          import re
           from pathlib import Path
-
+          import re
           p = Path('android/app/src/main/AndroidManifest.xml')
-          text = p.read_text()
+          text = p.read_text(encoding='utf-8')
+          manifest_match = re.search(r'<manifest\b[^>]*>', text)
+          if not manifest_match:
+              raise SystemExit('ERROR: AndroidManifest.xml has no manifest tag')
+          if 'android.permission.CAMERA' not in text:
+              text = text[:manifest_match.end()] + '\n    <uses-permission android:name="android.permission.CAMERA" />' + text[manifest_match.end():]
+          if 'android.hardware.camera.any' not in text:
+              text = text.replace('</manifest>', '    <uses-feature android:name="android.hardware.camera.any" android:required="false" />\n</manifest>')
+          # Explicitly disable Android immersive/full-screen flags on the activity.
+          text = re.sub(r'android:windowFullscreen="true"', 'android:windowFullscreen="false"', text)
+          p.write_text(text, encoding='utf-8')
+          PY
 
+          # Force normal system-bar visibility at Activity startup as well.
+          MAIN_JAVA="$(find android/app/src/main/java -name MainActivity.java -print -quit)"
+          if [ -z "$MAIN_JAVA" ]; then
+            echo "ERROR: MainActivity.java not found"
+            exit 1
+          fi
+          python3 - "$MAIN_JAVA" <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          text = p.read_text(encoding='utf-8')
+          if 'WindowManager.LayoutParams.FLAG_FULLSCREEN' not in text:
+              text = text.replace('import com.getcapacitor.BridgeActivity;', 'import com.getcapacitor.BridgeActivity;\nimport android.os.Bundle;\nimport android.view.View;\nimport android.view.WindowManager;')
+              text = text.replace('public class MainActivity extends BridgeActivity {', '''public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+                  getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_VISIBLE);
+              }''')
+          p.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Add Android back-button handling without changing website source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > native-support.js <<'JS'
+          import { App } from '@capacitor/app';
+          import { StatusBar } from '@capacitor/status-bar';
+
+          const byId = (id) => document.getElementById(id);
+          let lastBackAt = 0;
+          let toastTimer;
+
+          function toast(text) {
+            let el = byId('accessone-native-back-toast');
+            if (!el) {
+              el = document.createElement('div');
+              el.id = 'accessone-native-back-toast';
+              el.style.cssText = 'position:fixed;z-index:2147483647;left:50%;bottom:calc(26px + env(safe-area-inset-bottom));transform:translateX(-50%);background:#242424;color:#fff;padding:12px 18px;border-radius:24px;font:14px Arial,sans-serif;box-shadow:0 3px 14px #0005;white-space:nowrap;pointer-events:none;';
+              document.body.appendChild(el);
+            }
+            el.textContent = text;
+            el.style.display = 'block';
+            clearTimeout(toastTimer);
+            toastTimer = setTimeout(() => { el.style.display = 'none'; }, 1900);
+          }
+
+          function isVisible(el) {
+            if (!el) return false;
+            return el.classList.contains('show') || el.classList.contains('open');
+          }
+
+          function handleBack() {
+            // Close the app's header menu first.
+            const menu = byId('menu');
+            if (isVisible(menu)) {
+              menu.classList.remove('open');
+              return;
+            }
+
+            // Close the active face camera and stop its media stream.
+            const camera = byId('cam');
+            if (isVisible(camera)) {
+              if (typeof window.closeCamera === 'function') window.closeCamera();
+              else camera.classList.remove('show');
+              return;
+            }
+
+            // Close image preview.
+            const imageView = byId('imageView');
+            if (isVisible(imageView)) {
+              if (typeof window.closeImage === 'function') window.closeImage();
+              else imageView.classList.remove('show');
+              return;
+            }
+
+            // Close the top-most AccessOne dialog/popup.
+            for (const id of ['pinModal', 'wizard', 'settings']) {
+              const modal = byId(id);
+              if (isVisible(modal)) {
+                if (typeof window.hide === 'function') window.hide(id);
+                else modal.classList.remove('show');
+                return;
+              }
+            }
+
+            // Any separate information page returns to the main Scan page.
+            const page = (location.pathname.split('/').pop() || 'index.html').toLowerCase();
+            if (page && page !== 'index.html') {
+              location.replace('./index.html');
+              return;
+            }
+
+            // From every other bottom tab, return to Scan.
+            const activeSection = document.querySelector('main section.active');
+            if (activeSection && activeSection.id !== 'scan') {
+              if (typeof window.go === 'function') window.go('scan');
+              lastBackAt = 0;
+              return;
+            }
+
+            // On Scan, require two presses within two seconds to exit.
+            const now = Date.now();
+            if (now - lastBackAt <= 2000) {
+              App.exitApp();
+              return;
+            }
+            lastBackAt = now;
+            toast('Press back again to exit');
+          }
+
+          document.addEventListener('DOMContentLoaded', async () => {
+            // Keep Android status bar and navigation bar visible (not immersive).
+            try { await StatusBar.setOverlaysWebView({ overlay: false }); } catch (_) {}
+            try { await StatusBar.show(); } catch (_) {}
+            try { await StatusBar.setBackgroundColor({ color: '#081322' }); } catch (_) {}
+            try { if (document.fullscreenElement && document.exitFullscreen) await document.exitFullscreen(); } catch (_) {}
+            document.addEventListener('fullscreenchange', async () => {
+              if (document.fullscreenElement && document.exitFullscreen) {
+                try { await document.exitFullscreen(); } catch (_) {}
+              }
+            });
+          }, { once: true });
+
+          App.addListener('backButton', handleBack);
+          JS
+
+          npx esbuild native-support.js --bundle --format=iife --platform=browser --outfile=www/capacitor-native.js
+          python3 - <<'PY'
+          from pathlib import Path
+          tag = '<script src="./capacitor-native.js"></script>'
+          for p in Path('www').rglob('*.html'):
+              text = p.read_text(encoding='utf-8')
+              if 'capacitor-native.js' in text:
+                  continue
+              if '</body>' in text:
+                  text = text.replace('</body>', tag + '\n</body>', 1)
+              else:
+                  text += '\n' + tag
+              p.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Keep the supplied launcher logo unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f logo.png
+          mkdir -p android/app/src/main/res/drawable-nodpi
+          cp logo.png android/app/src/main/res/drawable-nodpi/access_one_logo.png
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          text = p.read_text(encoding='utf-8')
           match = re.search(r'<application\b[^>]*>', text, re.DOTALL)
-
           if not match:
               raise SystemExit('ERROR: application tag not found')
-
           tag = match.group(0)
-
           tag = re.sub(r'\s+android:icon="[^"]*"', '', tag)
           tag = re.sub(r'\s+android:roundIcon="[^"]*"', '', tag)
-
           tag = tag[:-1] + ' android:icon="@drawable/access_one_logo">'
-
           text = text[:match.start()] + tag + text[match.end():]
-
-          p.write_text(text)
+          p.write_text(text, encoding='utf-8')
           PY
+
+      - name: Sync Capacitor
+        run: npx cap sync android
 
       - name: Build debug APK
         shell: bash
@@ -117,3 +276,4 @@ jobs:
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 7
+          
