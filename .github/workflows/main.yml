@@ -1,0 +1,119 @@
+name: Build Access One APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Access One.zip"
+      - "logo.png"
+      - ".github/workflows/main.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+
+      - name: Extract website
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p website
+          unzip -o "Access One.zip" -d website
+
+          INDEX_FILE="$(find website -type f -name index.html | head -n 1)"
+
+          if [ -z "$INDEX_FILE" ]; then
+            echo "ERROR: index.html not found in Access One.zip"
+            exit 1
+          fi
+
+          WEBSITE_ROOT="$(dirname "$INDEX_FILE")"
+          mkdir -p www
+          cp -R "$WEBSITE_ROOT"/. www/
+
+      - name: Create Capacitor project
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm init -y
+          npm install @capacitor/core@latest @capacitor/android@latest
+          npm install --save-dev @capacitor/cli@latest
+
+          npx cap init "Access One" "com.accessone.app" --web-dir www
+          npx cap add android
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Configure Android icon
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f logo.png
+
+          mkdir -p android/app/src/main/res/drawable-nodpi
+
+          cp logo.png android/app/src/main/res/drawable-nodpi/access_one_logo.png
+
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path('android/app/src/main/AndroidManifest.xml')
+          text = p.read_text()
+
+          match = re.search(r'<application\b[^>]*>', text, re.DOTALL)
+
+          if not match:
+              raise SystemExit('ERROR: application tag not found')
+
+          tag = match.group(0)
+
+          tag = re.sub(r'\s+android:icon="[^"]*"', '', tag)
+          tag = re.sub(r'\s+android:roundIcon="[^"]*"', '', tag)
+
+          tag = tag[:-1] + ' android:icon="@drawable/access_one_logo">'
+
+          text = text[:match.start()] + tag + text[match.end():]
+
+          p.write_text(text)
+          PY
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AccessOne-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
