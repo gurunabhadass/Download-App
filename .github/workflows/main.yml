@@ -62,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           npm init -y
-          npm install @capacitor/core@latest @capacitor/android@latest @capacitor/app@latest @capacitor/status-bar@latest
+          npm install @capacitor/core@latest @capacitor/android@latest @capacitor/app@latest @capacitor/status-bar@latest @capacitor/share@latest
           npm install --save-dev @capacitor/cli@latest esbuild
           npx cap init "AccessOne" "com.accessone.app" --web-dir www
           npx cap add android
@@ -228,6 +228,176 @@ jobs:
               text = p.read_text(encoding='utf-8')
               if 'capacitor-native.js' in text:
                   continue
+              if '</body>' in text:
+                  text = text.replace('</body>', tag + '\n</body>', 1)
+              else:
+                  text += '\n' + tag
+              p.write_text(text, encoding='utf-8')
+          PY
+
+
+      - name: Add native PDF Excel download and Android share support
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Create a small native Android bridge that saves exported files into
+          # the public Downloads/AccessOne folder on Android 10+, and app Downloads
+          # on older Android versions.
+          MAIN_JAVA="$(find android/app/src/main/java -name MainActivity.java -print -quit)"
+          test -n "$MAIN_JAVA"
+          JAVA_DIR="$(dirname "$MAIN_JAVA")"
+          PACKAGE_LINE="$(grep -m1 '^package ' "$MAIN_JAVA")"
+          PACKAGE_NAME="${PACKAGE_LINE#package }"
+          PACKAGE_NAME="${PACKAGE_NAME%;}"
+          PLUGIN_JAVA="$JAVA_DIR/AccessOneFilesPlugin.java"
+
+          cat > "$PLUGIN_JAVA" <<JAVA
+          package $PACKAGE_NAME;
+
+          import android.content.ContentValues;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+
+          @CapacitorPlugin(name = "AccessOneFiles")
+          public class AccessOneFilesPlugin extends Plugin {
+              @PluginMethod
+              public void saveFile(PluginCall call) {
+                  String fileName = call.getString("fileName");
+                  String mimeType = call.getString("mimeType", "application/octet-stream");
+                  String base64Data = call.getString("base64Data");
+                  if (fileName == null || fileName.trim().isEmpty() || base64Data == null) {
+                      call.reject("Missing file name or file data");
+                      return;
+                  }
+                  OutputStream output = null;
+                  try {
+                      byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                      Uri savedUri;
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          ContentValues values = new ContentValues();
+                          values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+                          values.put(MediaStore.Downloads.MIME_TYPE, mimeType);
+                          values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AccessOne");
+                          values.put(MediaStore.Downloads.IS_PENDING, 1);
+                          Uri uri = getContext().getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                          if (uri == null) throw new Exception("Could not create download file");
+                          output = getContext().getContentResolver().openOutputStream(uri);
+                          if (output == null) throw new Exception("Could not open download file");
+                          output.write(bytes);
+                          output.flush();
+                          output.close();
+                          output = null;
+                          ContentValues done = new ContentValues();
+                          done.put(MediaStore.Downloads.IS_PENDING, 0);
+                          getContext().getContentResolver().update(uri, done, null, null);
+                          savedUri = uri;
+                      } else {
+                          File dir = getContext().getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                          if (dir == null) throw new Exception("Downloads folder unavailable");
+                          File folder = new File(dir, "AccessOne");
+                          if (!folder.exists() && !folder.mkdirs()) throw new Exception("Could not create Downloads folder");
+                          File file = new File(folder, fileName);
+                          output = new FileOutputStream(file);
+                          output.write(bytes);
+                          output.flush();
+                          output.close();
+                          output = null;
+                          savedUri = Uri.fromFile(file);
+                      }
+                      JSObject result = new JSObject();
+                      result.put("fileName", fileName);
+                      result.put("uri", savedUri.toString());
+                      result.put("location", "Downloads/AccessOne");
+                      call.resolve(result);
+                  } catch (Exception e) {
+                      try { if (output != null) output.close(); } catch (Exception ignored) {}
+                      call.reject("Download failed: " + e.getMessage(), e);
+                  }
+              }
+          }
+          JAVA
+
+          # Register the native file-saving plugin without changing other app behavior.
+          python3 - "$MAIN_JAVA" <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          text = p.read_text(encoding='utf-8')
+          if 'registerPlugin(AccessOneFilesPlugin.class)' not in text:
+              text = text.replace('super.onCreate(savedInstanceState);', 'registerPlugin(AccessOneFilesPlugin.class);\n        super.onCreate(savedInstanceState);', 1)
+          p.write_text(text, encoding='utf-8')
+          PY
+
+          # Override only the two existing browser fallback functions.
+          cat > download-share.js <<'JS'
+          import { registerPlugin } from '@capacitor/core';
+          import { Share } from '@capacitor/share';
+
+          const AccessOneFiles = registerPlugin('AccessOneFiles');
+          window.fileDownload = async function (blob, name) {
+            try {
+              const ext = String(name || '').split('.').pop().toLowerCase();
+              const mimeByExt = {
+                pdf: 'application/pdf',
+                xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                xls: 'application/vnd.ms-excel',
+                json: 'application/json',
+                csv: 'text/csv'
+              };
+              const mimeType = (blob && blob.type) || mimeByExt[ext] || 'application/octet-stream';
+              const bytes = new Uint8Array(await blob.arrayBuffer());
+              let binary = '';
+              const chunkSize = 0x8000;
+              for (let i = 0; i < bytes.length; i += chunkSize) {
+                binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+              }
+              const base64Data = btoa(binary);
+              await AccessOneFiles.saveFile({ fileName: name, mimeType, base64Data });
+              if (typeof window.msg === 'function') window.msg('Saved to Downloads/AccessOne');
+            } catch (error) {
+              console.error('AccessOne file download failed:', error);
+              if (typeof window.msg === 'function') window.msg('Download failed: ' + (error.message || 'Please try again'));
+            }
+          };
+
+          window.shareApp = async function () {
+            const appLink = 'https://gurunabhadass.github.io/Access_apk/';
+            try {
+              await Share.share({
+                title: 'AccessOne',
+                text: 'Download AccessOne - Smart Face Recognition & Access Control',
+                url: appLink,
+                dialogTitle: 'Share AccessOne'
+              });
+            } catch (error) {
+              // User cancellation is normal; do not copy a link automatically.
+              if (error && !String(error.message || '').toLowerCase().includes('cancel')) {
+                console.error('AccessOne native share failed:', error);
+                if (typeof window.msg === 'function') window.msg('Unable to open Android share panel');
+              }
+            }
+          };
+          JS
+
+          npx esbuild download-share.js --bundle --format=iife --platform=browser --outfile=www/capacitor-download-share.js
+          python3 - <<'PY'
+          from pathlib import Path
+          tag = '<script src="./capacitor-download-share.js"></script>'
+          p = Path('www/index.html')
+          text = p.read_text(encoding='utf-8')
+          if 'capacitor-download-share.js' not in text:
               if '</body>' in text:
                   text = text.replace('</body>', tag + '\n</body>', 1)
               else:
